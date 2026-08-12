@@ -208,6 +208,74 @@ function buildCorrelation(complaints) {
 }
 
 // ---------------------------------------------------------------------
+// MULE ACCOUNT CLUSTER DETECTION (secondary, weaker-confidence layer)
+// -----------------------------------------------------------------------
+// A fraud ring rarely reuses the same bank account for long - mule
+// accounts (opened by recruited/coerced individuals) are typically used
+// briefly then abandoned. So the same-account/same-phone/same-UPI exact
+// match above will usually MISS a gang that uses many different mule
+// accounts. What often stays constant, though, is WHERE those accounts
+// were opened: gangs frequently recruit many mules through the same
+// local agent/bank branch. This function flags branches (IFSC codes)
+// that show up across an unusually high number of DISTINCT accounts in
+// DIFFERENT complaints - a pattern worth an officer's manual review,
+// not a confirmed link like the identifier-based rings above.
+//
+// IMPORTANT LIMITATION: this is a proxy signal based only on what a
+// victim's complaint records (their own transfer's IFSC). It cannot see
+// the actual money trail (which account paid which account after that) -
+// that requires real bank transaction data, obtainable only through a
+// formal legal request (see the identity-verification note elsewhere in
+// this app). Treat every result here as "worth investigating", not
+// "confirmed mule ring".
+// ---------------------------------------------------------------------
+function buildMuleClusters(complaints, minDistinctAccounts = 3) {
+  const byIfsc = new Map(); // ifsc -> Map(account -> [complaint_ids])
+
+  complaints.forEach((c) => {
+    const ifsc = (c.ifsc_code || "").trim();
+    const account = (c.bank_account || "").trim();
+    if (!ifsc || !account) return; // need both to say "different account, same branch"
+    if (!byIfsc.has(ifsc)) byIfsc.set(ifsc, new Map());
+    const accMap = byIfsc.get(ifsc);
+    if (!accMap.has(account)) accMap.set(account, []);
+    accMap.get(account).push(c);
+  });
+
+  const clusters = [];
+  byIfsc.forEach((accMap, ifsc) => {
+    const distinctAccounts = accMap.size;
+    if (distinctAccounts < minDistinctAccounts) return; // not enough spread to be suspicious
+
+    const allComplaints = [];
+    accMap.forEach((list) => allComplaints.push(...list));
+
+    const states = [...new Set(allComplaints.map((c) => c.state))].sort();
+    const totalLoss = allComplaints.reduce((s, c) => s + (Number(c.amount_lost_inr) || 0), 0);
+    const bankGuess = ifsc.slice(0, 4); // first 4 letters = bank code, e.g. SBIN, HDFC
+
+    clusters.push({
+      ifsc,
+      bank_code: bankGuess,
+      distinct_accounts: distinctAccounts,
+      accounts: [...accMap.keys()],
+      complaint_count: allComplaints.length,
+      states,
+      cross_state: states.length > 1,
+      total_loss: totalLoss,
+      complaints: allComplaints.map((c) => ({
+        id: c.complaint_id, state: c.state, city: c.city, victim: c.victim_name,
+        account: c.bank_account, amount: c.amount_lost_inr, date: c.date_filed,
+        fraud_type: c.fraud_type,
+      })),
+    });
+  });
+
+  clusters.sort((a, b) => b.distinct_accounts - a.distinct_accounts || b.total_loss - a.total_loss);
+  return clusters;
+}
+
+// ---------------------------------------------------------------------
 // FORCE-DIRECTED GRAPH
 // ---------------------------------------------------------------------
 function RingGraph({ ring, onSelectNode, selectedNodeId, highlightId }) {
@@ -403,6 +471,8 @@ function Dashboard({ currentUser, onLogout }) {
   const [selectedRingId, setSelectedRingId] = useState(null);
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [query, setQuery] = useState("");
+  const [viewMode, setViewMode] = useState("rings"); // "rings" | "mules"
+  const [selectedMuleIfsc, setSelectedMuleIfsc] = useState(null);
   const [highlightId, setHighlightId] = useState(null);
   const [storageOK, setStorageOK] = useState(true);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -433,6 +503,11 @@ function Dashboard({ currentUser, onLogout }) {
 
   const allComplaints = useMemo(() => [...ALL_COMPLAINTS, ...extraComplaints], [extraComplaints]);
   const rings = useMemo(() => buildCorrelation(allComplaints), [allComplaints]);
+  const muleClusters = useMemo(() => buildMuleClusters(allComplaints), [allComplaints]);
+  const selectedMule = useMemo(
+    () => muleClusters.find((m) => m.ifsc === selectedMuleIfsc) ?? null,
+    [muleClusters, selectedMuleIfsc]
+  );
   const stats = useMemo(() => ({
     total_complaints: allComplaints.length,
     total_links: rings.reduce((s, r) => s + r.edges.length, 0),
@@ -580,6 +655,15 @@ function Dashboard({ currentUser, onLogout }) {
         .dash-body { display:flex; flex:1; min-height:0; overflow: hidden; }
         .sidebar { width:320px; border-right:1px solid var(--border); background:var(--panel); display:flex; flex-direction:column; min-height:0; overflow: hidden; }
         .sidebar-search { padding:14px; border-bottom:1px solid var(--border); }
+        .view-tabs { display:flex; border-bottom:1px solid var(--border); }
+        .view-tab { flex:1; text-align:center; padding:11px 6px; font-size:11.5px; font-weight:600; color:var(--text-faint); cursor:pointer; border-bottom:2px solid transparent; }
+        .view-tab.active { color:var(--teal); border-bottom-color:var(--teal); }
+        .mule-table-wrap { flex:1; overflow-y:auto; padding:18px 24px; }
+        .mule-warning { display:flex; gap:10px; font-size:12px; line-height:1.5; color:var(--text-dim); background:rgba(212,165,68,.06); border:1px solid rgba(212,165,68,.25); border-radius:8px; padding:12px 14px; margin-bottom:16px; }
+        .mule-table { width:100%; border-collapse:collapse; font-size:12px; }
+        .mule-table th { text-align:left; font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-faint); padding:8px 10px; border-bottom:1px solid var(--border); }
+        .mule-table td { padding:9px 10px; border-bottom:1px solid var(--border); color:var(--text-dim); }
+        .mule-table .mono { font-family:'JetBrains Mono',monospace; color:var(--text); }
         .search-box { display:flex; align-items:center; gap:8px; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; }
         .search-box input { background:transparent; border:none; outline:none; color:var(--text); font-size:13px; width:100%; font-family:'Inter',sans-serif; }
         .search-box input::placeholder { color:var(--text-faint); }
@@ -692,51 +776,145 @@ function Dashboard({ currentUser, onLogout }) {
 
       <div className="dash-body">
         <aside className="sidebar">
+          <div className="view-tabs">
+            <div className={"view-tab" + (viewMode === "rings" ? " active" : "")} onClick={() => setViewMode("rings")}>
+              Fraud Rings ({rings.length})
+            </div>
+            <div className={"view-tab" + (viewMode === "mules" ? " active" : "")} onClick={() => setViewMode("mules")}>
+              Mule Clusters ({muleClusters.length})
+            </div>
+          </div>
           <div className="sidebar-search">
             <div className="search-box">
               <Search size={14} color="#5B6577" />
               <input placeholder="Search state, phone, UPI..." value={query} onChange={(e) => setQuery(e.target.value)} />
             </div>
           </div>
-          <div className="ring-list">
-            {loadingStorage && <div style={{ padding: 16, fontSize: 12, color: "#5B6577" }}>Loading saved complaints...</div>}
-            {filteredRings.map((r) => {
-              const rs = RISK_STYLES[riskLevel(r)];
-              const active = r.cluster_id === selectedRingId;
-              return (
-                <div key={r.cluster_id} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": rs.color }} onClick={() => setSelectedRingId(r.cluster_id)}>
-                  <div className="ring-item-top">
-                    <span className="ring-id">{r.cluster_id}</span>
-                    <span className="risk-chip" style={{ color: rs.color, background: rs.glow, border: `1px solid ${rs.color}55` }}>{rs.label}</span>
+          {viewMode === "rings" ? (
+            <div className="ring-list">
+              {loadingStorage && <div style={{ padding: 16, fontSize: 12, color: "#5B6577" }}>Loading saved complaints...</div>}
+              {filteredRings.map((r) => {
+                const rs = RISK_STYLES[riskLevel(r)];
+                const active = r.cluster_id === selectedRingId;
+                return (
+                  <div key={r.cluster_id} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": rs.color }} onClick={() => setSelectedRingId(r.cluster_id)}>
+                    <div className="ring-item-top">
+                      <span className="ring-id">{r.cluster_id}</span>
+                      <span className="risk-chip" style={{ color: rs.color, background: rs.glow, border: `1px solid ${rs.color}55` }}>{rs.label}</span>
+                    </div>
+                    <div className="ring-item-meta">
+                      <span>{r.size} complaints</span><span>·</span><span>{Math.round(r.avg_confidence * 100)}% confidence</span>
+                    </div>
+                    <div className="ring-item-states">{r.states.length > 3 ? r.states.slice(0, 3).join(", ") + ` +${r.states.length - 3} more` : r.states.join(", ")}</div>
+                    <div className="ring-item-loss">{fmtINR(r.total_loss)}</div>
                   </div>
-                  <div className="ring-item-meta">
-                    <span>{r.size} complaints</span><span>·</span><span>{Math.round(r.avg_confidence * 100)}% confidence</span>
-                  </div>
-                  <div className="ring-item-states">{r.states.length > 3 ? r.states.slice(0, 3).join(", ") + ` +${r.states.length - 3} more` : r.states.join(", ")}</div>
-                  <div className="ring-item-loss">{fmtINR(r.total_loss)}</div>
+                );
+              })}
+              {rings.length === 0 && !loadingStorage && (
+                <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
+                  No confirmed fraud rings yet. Rings appear once 2+ complaints share an exact phone, UPI, or account match.
                 </div>
-              );
-            })}
-          </div>
+              )}
+            </div>
+          ) : (
+            <div className="ring-list">
+              {muleClusters.map((m) => {
+                const active = m.ifsc === selectedMuleIfsc;
+                return (
+                  <div key={m.ifsc} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": "#D4A544" }} onClick={() => setSelectedMuleIfsc(m.ifsc)}>
+                    <div className="ring-item-top">
+                      <span className="ring-id">{m.bank_code} · {m.ifsc}</span>
+                      <span className="risk-chip" style={{ color: "#D4A544", background: "rgba(212,165,68,0.2)", border: "1px solid #D4A54455" }}>REVIEW</span>
+                    </div>
+                    <div className="ring-item-meta">
+                      <span>{m.distinct_accounts} distinct accounts</span><span>·</span><span>{m.complaint_count} complaints</span>
+                    </div>
+                    <div className="ring-item-states">{m.states.length > 3 ? m.states.slice(0, 3).join(", ") + ` +${m.states.length - 3} more` : m.states.join(", ")}</div>
+                    <div className="ring-item-loss">{fmtINR(m.total_loss)}</div>
+                  </div>
+                );
+              })}
+              {muleClusters.length === 0 && (
+                <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
+                  No suspected mule clusters yet. A branch is flagged once 3+ different account numbers at the same IFSC appear across separate complaints.
+                </div>
+              )}
+            </div>
+          )}
         </aside>
 
         <main className="main-area">
-          <div className="main-toolbar">
-            <div>
-              <div className="toolbar-title">
-                <AlertTriangle size={16} color={selectedRing ? RISK_STYLES[riskLevel(selectedRing)].color : "#5B6577"} />
-                {selectedRing ? selectedRing.cluster_id : "No cluster selected"}
+          {viewMode === "rings" ? (
+            <>
+              <div className="main-toolbar">
+                <div>
+                  <div className="toolbar-title">
+                    <AlertTriangle size={16} color={selectedRing ? RISK_STYLES[riskLevel(selectedRing)].color : "#5B6577"} />
+                    {selectedRing ? selectedRing.cluster_id : "No cluster selected"}
+                  </div>
+                  {selectedRing && <div className="toolbar-sub">{selectedRing.size} linked complaints · {selectedRing.states.join(" → ")}</div>}
+                </div>
+                {selectedRing && <div className="confidence-pill">{Math.round(selectedRing.avg_confidence * 100)}% avg link confidence</div>}
               </div>
-              {selectedRing && <div className="toolbar-sub">{selectedRing.size} linked complaints · {selectedRing.states.join(" → ")}</div>}
-            </div>
-            {selectedRing && <div className="confidence-pill">{Math.round(selectedRing.avg_confidence * 100)}% avg link confidence</div>}
-          </div>
-          <RingGraph ring={selectedRing} onSelectNode={setSelectedNodeId} selectedNodeId={selectedNodeId} highlightId={highlightId} />
-          <div className="legend">
-            <div>Edge = shared identifier (phone / UPI / account / IFSC)</div>
-            <div>Thicker line = higher confidence</div>
-            <div>Click a node to view complaint detail →</div>
-          </div>
+              <RingGraph ring={selectedRing} onSelectNode={setSelectedNodeId} selectedNodeId={selectedNodeId} highlightId={highlightId} />
+              <div className="legend">
+                <div>Edge = shared identifier (phone / UPI / account / IFSC)</div>
+                <div>Thicker line = higher confidence</div>
+                <div>Click a node to view complaint detail →</div>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="main-toolbar">
+                <div>
+                  <div className="toolbar-title">
+                    <AlertTriangle size={16} color={selectedMule ? "#D4A544" : "#5B6577"} />
+                    {selectedMule ? `${selectedMule.bank_code} branch — ${selectedMule.ifsc}` : "No branch selected"}
+                  </div>
+                  {selectedMule && <div className="toolbar-sub">{selectedMule.distinct_accounts} distinct accounts · {selectedMule.complaint_count} complaints</div>}
+                </div>
+              </div>
+              {selectedMule ? (
+                <div className="mule-table-wrap">
+                  <div className="mule-warning">
+                    <AlertCircle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
+                    <div>
+                      <b>{selectedMule.distinct_accounts} different bank accounts</b>, all opened at the same branch
+                      (<span className="field-value" style={{ fontSize: 12 }}>{selectedMule.ifsc}</span>), appear across
+                      {" "}{selectedMule.complaint_count} separate complaints in {selectedMule.states.join(", ")}. This does
+                      not confirm a mule network on its own — it is a pattern worth manual review, since gangs often
+                      recruit multiple mules through the same local branch/agent.
+                    </div>
+                  </div>
+                  <table className="mule-table">
+                    <thead>
+                      <tr><th>Complaint</th><th>Account No.</th><th>State / City</th><th>Fraud Type</th><th>Amount</th></tr>
+                    </thead>
+                    <tbody>
+                      {selectedMule.complaints.map((c) => (
+                        <tr key={c.id}>
+                          <td className="mono">{c.id}</td>
+                          <td className="mono">{c.account}</td>
+                          <td>{c.city}, {c.state}</td>
+                          <td>{c.fraud_type}</td>
+                          <td className="mono">{fmtINR(Number(c.amount))}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="graph-empty">
+                  <Shield size={40} strokeWidth={1.2} />
+                  <p>Select a branch cluster to review its accounts</p>
+                </div>
+              )}
+              <div className="legend">
+                <div>Grouped by shared bank branch (IFSC), with different account numbers</div>
+                <div>Proxy signal only — confirm via legal request to the bank before acting</div>
+              </div>
+            </>
+          )}
         </main>
 
         <aside className="detail-panel">
