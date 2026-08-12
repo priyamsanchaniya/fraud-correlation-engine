@@ -1,9 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import * as d3 from "d3";
 import {
+  BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis,
+  CartesianGrid, Tooltip, ResponsiveContainer, Legend,
+} from "recharts";
+import {
   AlertTriangle, MapPin, Shield, IndianRupee, Phone, CreditCard,
   ArrowLeft, Search, Plus, X, CheckCircle2, Loader2, AlertCircle, Trash2,
-  LogOut, Lock, UserPlus, Eye, EyeOff, KeyRound,
+  LogOut, Lock, UserPlus, Eye, EyeOff, KeyRound, BarChart3,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------
@@ -276,6 +280,53 @@ function buildMuleClusters(complaints, minDistinctAccounts = 3) {
 }
 
 // ---------------------------------------------------------------------
+// ANALYTICS AGGREGATION
+// ---------------------------------------------------------------------
+function buildAnalytics(complaints) {
+  const byState = new Map();
+  const byFraudType = new Map();
+  const byMonth = new Map();
+  let totalLoss = 0;
+
+  complaints.forEach((c) => {
+    const amt = Number(c.amount_lost_inr) || 0;
+    totalLoss += amt;
+
+    const st = c.state || "Unknown";
+    if (!byState.has(st)) byState.set(st, { state: st, complaints: 0, loss: 0 });
+    byState.get(st).complaints += 1;
+    byState.get(st).loss += amt;
+
+    const ft = c.fraud_type || "Unknown";
+    if (!byFraudType.has(ft)) byFraudType.set(ft, { type: ft, count: 0 });
+    byFraudType.get(ft).count += 1;
+
+    const month = (c.date_filed || "").slice(0, 7); // YYYY-MM
+    if (month) {
+      if (!byMonth.has(month)) byMonth.set(month, { month, complaints: 0, loss: 0 });
+      byMonth.get(month).complaints += 1;
+      byMonth.get(month).loss += amt;
+    }
+  });
+
+  const stateData = [...byState.values()].sort((a, b) => b.complaints - a.complaints).slice(0, 10);
+  const fraudTypeData = [...byFraudType.values()].sort((a, b) => b.count - a.count);
+  const monthData = [...byMonth.values()].sort((a, b) => a.month.localeCompare(b.month));
+
+  return {
+    totalComplaints: complaints.length,
+    totalLoss,
+    avgLoss: complaints.length ? Math.round(totalLoss / complaints.length) : 0,
+    statesAffected: byState.size,
+    stateData,
+    fraudTypeData,
+    monthData,
+  };
+}
+
+const CHART_COLORS = ["#4A9B8E", "#D4A544", "#E8543F", "#6B7A8F", "#8A93A3", "#2E7D6E", "#B8860B", "#C0392B"];
+
+// ---------------------------------------------------------------------
 // FORCE-DIRECTED GRAPH
 // ---------------------------------------------------------------------
 function RingGraph({ ring, onSelectNode, selectedNodeId, highlightId }) {
@@ -471,8 +522,9 @@ function Dashboard({ currentUser, onLogout }) {
   const [selectedRingId, setSelectedRingId] = useState(null);
   const [selectedNodeId, setSelectedNodeId] = useState(null);
   const [query, setQuery] = useState("");
-  const [viewMode, setViewMode] = useState("rings"); // "rings" | "mules"
+  const [viewMode, setViewMode] = useState("rings"); // "rings" | "mules" | "analytics" | "all"
   const [selectedMuleIfsc, setSelectedMuleIfsc] = useState(null);
+  const [selectedAllComplaintId, setSelectedAllComplaintId] = useState(null);
   const [highlightId, setHighlightId] = useState(null);
   const [storageOK, setStorageOK] = useState(true);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -504,6 +556,33 @@ function Dashboard({ currentUser, onLogout }) {
   const allComplaints = useMemo(() => [...ALL_COMPLAINTS, ...extraComplaints], [extraComplaints]);
   const rings = useMemo(() => buildCorrelation(allComplaints), [allComplaints]);
   const muleClusters = useMemo(() => buildMuleClusters(allComplaints), [allComplaints]);
+  const analytics = useMemo(() => buildAnalytics(allComplaints), [allComplaints]);
+
+  const complaintRingMap = useMemo(() => {
+    const map = new Map();
+    rings.forEach((r) => r.member_ids.forEach((id) => map.set(id, r.cluster_id)));
+    return map;
+  }, [rings]);
+
+  const filteredAllComplaints = useMemo(() => {
+    let list = allComplaints;
+    if (query.trim()) {
+      const q = query.toLowerCase();
+      list = list.filter((c) =>
+        (c.state || "").toLowerCase().includes(q) ||
+        (c.phone_used_by_fraudster || "").includes(q) ||
+        (c.upi_id || "").toLowerCase().includes(q) ||
+        (c.city || "").toLowerCase().includes(q) ||
+        (c.complaint_id || "").toLowerCase().includes(q)
+      );
+    }
+    return [...list].sort((a, b) => (b.date_filed || "").localeCompare(a.date_filed || ""));
+  }, [allComplaints, query]);
+
+  const selectedAllComplaint = useMemo(
+    () => allComplaints.find((c) => c.complaint_id === selectedAllComplaintId) ?? null,
+    [allComplaints, selectedAllComplaintId]
+  );
   const selectedMule = useMemo(
     () => muleClusters.find((m) => m.ifsc === selectedMuleIfsc) ?? null,
     [muleClusters, selectedMuleIfsc]
@@ -664,6 +743,15 @@ function Dashboard({ currentUser, onLogout }) {
         .mule-table th { text-align:left; font-size:10px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-faint); padding:8px 10px; border-bottom:1px solid var(--border); }
         .mule-table td { padding:9px 10px; border-bottom:1px solid var(--border); color:var(--text-dim); }
         .mule-table .mono { font-family:'JetBrains Mono',monospace; color:var(--text); }
+        .clickable-row { cursor:pointer; }
+        .clickable-row:hover { background:var(--panel); }
+        .analytics-summary-item { padding:14px 16px; border-bottom:1px solid var(--border); }
+        .analytics-summary-label { font-size:10.5px; color:var(--text-faint); text-transform:uppercase; letter-spacing:.06em; margin-bottom:5px; }
+        .analytics-summary-value { font-family:'JetBrains Mono',monospace; font-size:19px; font-weight:600; color:var(--text); }
+        .analytics-wrap { flex:1; overflow-y:auto; display:flex; flex-direction:column; }
+        .analytics-grid { display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:20px 24px; }
+        .chart-card { background:var(--panel-2); border:1px solid var(--border); border-radius:10px; padding:16px; }
+        .chart-card-title { font-size:12px; font-weight:600; color:var(--text-dim); margin-bottom:8px; }
         .search-box { display:flex; align-items:center; gap:8px; background:var(--panel-2); border:1px solid var(--border); border-radius:6px; padding:8px 10px; }
         .search-box input { background:transparent; border:none; outline:none; color:var(--text); font-size:13px; width:100%; font-family:'Inter',sans-serif; }
         .search-box input::placeholder { color:var(--text-faint); }
@@ -783,14 +871,70 @@ function Dashboard({ currentUser, onLogout }) {
             <div className={"view-tab" + (viewMode === "mules" ? " active" : "")} onClick={() => setViewMode("mules")}>
               Mule Clusters ({muleClusters.length})
             </div>
-          </div>
-          <div className="sidebar-search">
-            <div className="search-box">
-              <Search size={14} color="#5B6577" />
-              <input placeholder="Search state, phone, UPI..." value={query} onChange={(e) => setQuery(e.target.value)} />
+            <div className={"view-tab" + (viewMode === "analytics" ? " active" : "")} onClick={() => setViewMode("analytics")}>
+              Analytics
+            </div>
+            <div className={"view-tab" + (viewMode === "all" ? " active" : "")} onClick={() => setViewMode("all")}>
+              All ({stats.total_complaints})
             </div>
           </div>
-          {viewMode === "rings" ? (
+          {viewMode !== "analytics" && (
+            <div className="sidebar-search">
+              <div className="search-box">
+                <Search size={14} color="#5B6577" />
+                <input placeholder="Search state, phone, UPI..." value={query} onChange={(e) => setQuery(e.target.value)} />
+              </div>
+            </div>
+          )}
+          {viewMode === "analytics" ? (
+            <div className="ring-list">
+              <div className="analytics-summary-item">
+                <div className="analytics-summary-label">Total Complaints</div>
+                <div className="analytics-summary-value">{analytics.totalComplaints}</div>
+              </div>
+              <div className="analytics-summary-item">
+                <div className="analytics-summary-label">Total Reported Loss</div>
+                <div className="analytics-summary-value" style={{ color: "#E8543F" }}>{fmtINR(analytics.totalLoss)}</div>
+              </div>
+              <div className="analytics-summary-item">
+                <div className="analytics-summary-label">Average Loss / Complaint</div>
+                <div className="analytics-summary-value">{fmtINR(analytics.avgLoss)}</div>
+              </div>
+              <div className="analytics-summary-item">
+                <div className="analytics-summary-label">States Affected</div>
+                <div className="analytics-summary-value">{analytics.statesAffected}</div>
+              </div>
+            </div>
+          ) : viewMode === "all" ? (
+            <div className="ring-list">
+              {filteredAllComplaints.map((c) => {
+                const ringId = complaintRingMap.get(c.complaint_id);
+                const active = c.complaint_id === selectedAllComplaintId;
+                return (
+                  <div key={c.complaint_id} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": ringId ? "#E8543F" : "#6B7A8F" }} onClick={() => setSelectedAllComplaintId(c.complaint_id)}>
+                    <div className="ring-item-top">
+                      <span className="ring-id">{c.complaint_id}</span>
+                      {ringId ? (
+                        <span className="risk-chip" style={{ color: "#E8543F", background: "rgba(232,84,63,0.15)", border: "1px solid #E8543F55" }}>IN {ringId}</span>
+                      ) : (
+                        <span className="risk-chip" style={{ color: "#8A93A3", background: "rgba(138,147,163,0.12)", border: "1px solid #8A93A355" }}>ISOLATED</span>
+                      )}
+                    </div>
+                    <div className="ring-item-meta">
+                      <span>{c.fraud_type}</span>
+                    </div>
+                    <div className="ring-item-states">{c.city}, {c.state} · {c.date_filed}</div>
+                    <div className="ring-item-loss">{fmtINR(Number(c.amount_lost_inr) || 0)}</div>
+                  </div>
+                );
+              })}
+              {filteredAllComplaints.length === 0 && (
+                <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
+                  No complaints match your search.
+                </div>
+              )}
+            </div>
+          ) : viewMode === "rings" ? (
             <div className="ring-list">
               {loadingStorage && <div style={{ padding: 16, fontSize: 12, color: "#5B6577" }}>Loading saved complaints...</div>}
               {filteredRings.map((r) => {
@@ -844,7 +988,100 @@ function Dashboard({ currentUser, onLogout }) {
         </aside>
 
         <main className="main-area">
-          {viewMode === "rings" ? (
+          {viewMode === "analytics" ? (
+            <div className="analytics-wrap">
+              <div className="main-toolbar">
+                <div>
+                  <div className="toolbar-title">
+                    <BarChart3 size={16} color="#4A9B8E" />
+                    Complaint Analytics
+                  </div>
+                  <div className="toolbar-sub">Aggregated view across all {analytics.totalComplaints} complaints on record</div>
+                </div>
+              </div>
+              <div className="analytics-grid">
+                <div className="chart-card">
+                  <div className="chart-card-title">Complaints by State (Top 10)</div>
+                  {analytics.stateData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={240}>
+                      <BarChart data={analytics.stateData} layout="vertical" margin={{ left: 10, right: 20 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#232B38" horizontal={false} />
+                        <XAxis type="number" tick={{ fill: "#8A93A3", fontSize: 10 }} stroke="#232B38" />
+                        <YAxis type="category" dataKey="state" width={90} tick={{ fill: "#8A93A3", fontSize: 10.5 }} stroke="#232B38" />
+                        <Tooltip contentStyle={{ background: "#151B26", border: "1px solid #232B38", borderRadius: 6, fontSize: 12 }} labelStyle={{ color: "#E8EAED" }} />
+                        <Bar dataKey="complaints" fill="#4A9B8E" radius={[0, 4, 4, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  ) : <EmptyChartNote />}
+                </div>
+
+                <div className="chart-card">
+                  <div className="chart-card-title">Fraud Type Breakdown</div>
+                  {analytics.fraudTypeData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={240}>
+                      <PieChart>
+                        <Pie data={analytics.fraudTypeData} dataKey="count" nameKey="type" cx="50%" cy="50%" outerRadius={80} label={({ percent }) => `${(percent * 100).toFixed(0)}%`} labelLine={false}>
+                          {analytics.fraudTypeData.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+                        </Pie>
+                        <Tooltip contentStyle={{ background: "#151B26", border: "1px solid #232B38", borderRadius: 6, fontSize: 12 }} labelStyle={{ color: "#E8EAED" }} />
+                        <Legend wrapperStyle={{ fontSize: 10.5, color: "#8A93A3" }} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  ) : <EmptyChartNote />}
+                </div>
+
+                <div className="chart-card" style={{ gridColumn: "1 / -1" }}>
+                  <div className="chart-card-title">Complaints & Loss Over Time (by Month)</div>
+                  {analytics.monthData.length > 0 ? (
+                    <ResponsiveContainer width="100%" height={220}>
+                      <LineChart data={analytics.monthData} margin={{ left: 0, right: 20 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#232B38" />
+                        <XAxis dataKey="month" tick={{ fill: "#8A93A3", fontSize: 10.5 }} stroke="#232B38" />
+                        <YAxis yAxisId="left" tick={{ fill: "#8A93A3", fontSize: 10 }} stroke="#232B38" />
+                        <YAxis yAxisId="right" orientation="right" tick={{ fill: "#8A93A3", fontSize: 10 }} stroke="#232B38" tickFormatter={(v) => `₹${(v / 1000).toFixed(0)}k`} />
+                        <Tooltip contentStyle={{ background: "#151B26", border: "1px solid #232B38", borderRadius: 6, fontSize: 12 }} labelStyle={{ color: "#E8EAED" }} formatter={(v, name) => name === "loss" ? [fmtINR(v), "Loss"] : [v, "Complaints"]} />
+                        <Legend wrapperStyle={{ fontSize: 10.5, color: "#8A93A3" }} />
+                        <Line yAxisId="left" type="monotone" dataKey="complaints" stroke="#4A9B8E" strokeWidth={2} dot={{ r: 3 }} name="complaints" />
+                        <Line yAxisId="right" type="monotone" dataKey="loss" stroke="#D4A544" strokeWidth={2} dot={{ r: 3 }} name="loss" />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  ) : <EmptyChartNote />}
+                </div>
+              </div>
+            </div>
+          ) : viewMode === "all" ? (
+            <div className="mule-table-wrap" style={{ flex: 1 }}>
+              <div className="main-toolbar" style={{ padding: "0 0 16px 0", border: "none" }}>
+                <div>
+                  <div className="toolbar-title">
+                    <Shield size={16} color="#4A9B8E" />
+                    All Complaints
+                  </div>
+                  <div className="toolbar-sub">{filteredAllComplaints.length} record(s) · click a row to view full detail</div>
+                </div>
+              </div>
+              <table className="mule-table">
+                <thead>
+                  <tr><th>ID</th><th>Date</th><th>State / City</th><th>Fraud Type</th><th>Amount</th><th>Status</th></tr>
+                </thead>
+                <tbody>
+                  {filteredAllComplaints.map((c) => {
+                    const ringId = complaintRingMap.get(c.complaint_id);
+                    return (
+                      <tr key={c.complaint_id} className="clickable-row" onClick={() => setSelectedAllComplaintId(c.complaint_id)}>
+                        <td className="mono">{c.complaint_id}</td>
+                        <td className="mono">{c.date_filed}</td>
+                        <td>{c.city}, {c.state}</td>
+                        <td>{c.fraud_type}</td>
+                        <td className="mono">{fmtINR(Number(c.amount_lost_inr) || 0)}</td>
+                        <td>{ringId ? <span style={{ color: "#E8543F" }}>In {ringId}</span> : <span style={{ color: "#6B7A8F" }}>Isolated</span>}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          ) : viewMode === "rings" ? (
             <>
               <div className="main-toolbar">
                 <div>
@@ -918,7 +1155,38 @@ function Dashboard({ currentUser, onLogout }) {
         </main>
 
         <aside className="detail-panel">
-          {selectedNode ? (
+          {viewMode === "all" && selectedAllComplaint ? (
+            <>
+              <button className="back-link" onClick={() => setSelectedAllComplaintId(null)}><ArrowLeft size={13} /> Back to list</button>
+              <div className="detail-section-title">Complaint Record</div>
+              <div className="field-row"><Shield size={13} /><div><div className="field-label">Complaint ID</div><div className="field-value">{selectedAllComplaint.complaint_id}</div></div></div>
+              <div className="field-row"><MapPin size={13} /><div><div className="field-label">Filed at</div><div className="field-value">{selectedAllComplaint.city}, {selectedAllComplaint.state} — {selectedAllComplaint.date_filed}</div></div></div>
+              <div className="field-row"><Shield size={13} /><div><div className="field-label">Victim name</div><div className="field-value">{selectedAllComplaint.victim_name}</div></div></div>
+              <div className="field-row"><AlertTriangle size={13} /><div><div className="field-label">Fraud type</div><div className="field-value">{selectedAllComplaint.fraud_type}</div></div></div>
+              <div className="field-row"><IndianRupee size={13} /><div><div className="field-label">Amount lost</div><div className="field-value">{fmtINR(Number(selectedAllComplaint.amount_lost_inr) || 0)}</div></div></div>
+              <div className="detail-section-title">Identifiers Reported</div>
+              <div className="field-row"><Phone size={13} /><div><div className="field-label">Fraudster phone</div><div className="field-value">{selectedAllComplaint.phone_used_by_fraudster || "—"}</div></div></div>
+              <div className="field-row"><CreditCard size={13} /><div><div className="field-label">UPI ID</div><div className="field-value">{selectedAllComplaint.upi_id || "—"}</div></div></div>
+              <div className="field-row"><CreditCard size={13} /><div><div className="field-label">Bank account</div><div className="field-value">{selectedAllComplaint.bank_account || "—"}</div></div></div>
+              <div className="field-row"><CreditCard size={13} /><div><div className="field-label">IFSC</div><div className="field-value">{selectedAllComplaint.ifsc_code || "—"}</div></div></div>
+              <div className="detail-section-title">Modus Operandi</div>
+              <div className="mo-text">{selectedAllComplaint.mo_description}</div>
+              {complaintRingMap.get(selectedAllComplaint.complaint_id) ? (
+                <div className="hint-text" style={{ background: "rgba(232,84,63,.06)", borderColor: "rgba(232,84,63,.2)" }}>
+                  This complaint is linked to <b>{complaintRingMap.get(selectedAllComplaint.complaint_id)}</b> — switch to the "Fraud Rings" tab to see the full connected network.
+                </div>
+              ) : (
+                <div className="hint-text">
+                  No matching identifiers found in any other complaint yet — currently an isolated record.
+                </div>
+              )}
+              {selectedAllComplaint.submitted_by_name && (
+                <div className="hint-text">
+                  Submitted by <b>{selectedAllComplaint.submitted_by_name}</b> ({selectedAllComplaint.submitted_by_state} Cyber Cell)
+                </div>
+              )}
+            </>
+          ) : selectedNode ? (
             <>
               <button className="back-link" onClick={() => setSelectedNodeId(null)}><ArrowLeft size={13} /> Back to ring summary</button>
               <div className="detail-section-title">Complaint Record</div>
@@ -1076,6 +1344,14 @@ async function sha256Hex(text) {
   const enc = new TextEncoder().encode(text);
   const buf = await crypto.subtle.digest("SHA-256", enc);
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function EmptyChartNote() {
+  return (
+    <div style={{ height: 200, display: "flex", alignItems: "center", justifyContent: "center", color: "#5B6577", fontSize: 12 }}>
+      Not enough data yet — add complaints to see this chart.
+    </div>
+  );
 }
 
 function EmptyState({ icon: Icon, title, sub }) {
