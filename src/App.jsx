@@ -80,11 +80,19 @@ function validateComplaint(form) {
 // ---------------------------------------------------------------------
 // JS CORRELATION ENGINE (mirrors correlation_engine.py build_correlation_graph)
 // ---------------------------------------------------------------------
+// NOTE: IFSC (bank branch code) is deliberately NOT included here.
+// An IFSC alone is shared by thousands of unrelated customers at that
+// branch, so two complaints matching only on IFSC are NOT good evidence
+// of a real fraud ring - including it here would create logically
+// meaningless "rings" (two random victims who happen to bank at the
+// same branch). IFSC-based patterns are handled separately and more
+// carefully by buildMuleClusters() below, which only flags a branch
+// when 3+ DISTINCT account numbers appear across different complaints -
+// a much stronger and more honest signal than a single shared IFSC.
 const MATCH_WEIGHTS = {
   phone_used_by_fraudster: 0.9,
   upi_id: 0.9,
   bank_account: 0.95,
-  ifsc_code: 0.3,
 };
 
 function buildCorrelation(complaints) {
@@ -1095,7 +1103,7 @@ function Dashboard({ currentUser, onLogout }) {
               </div>
               <RingGraph ring={selectedRing} onSelectNode={setSelectedNodeId} selectedNodeId={selectedNodeId} highlightId={highlightId} />
               <div className="legend">
-                <div>Edge = shared identifier (phone / UPI / account / IFSC)</div>
+                <div>Edge = shared identifier (phone / UPI / account)</div>
                 <div>Thicker line = higher confidence</div>
                 <div>Click a node to view complaint detail →</div>
               </div>
