@@ -264,7 +264,53 @@ function buildMuleClusters(complaints, minDistinctAccounts = 3) {
 
     const states = [...new Set(allComplaints.map((c) => c.state))].sort();
     const totalLoss = allComplaints.reduce((s, c) => s + (Number(c.amount_lost_inr) || 0), 0);
-    const bankGuess = ifsc.slice(0, 4); // first 4 letters = bank code, e.g. SBIN, HDFC
+    const bankGuess = ifsc.slice(0, 4);
+
+    // -------------------------------------------------------------
+    // EVIDENCE SIGNALS - each one that fires is concrete, checkable
+    // evidence added to the flag. This is what "catching" a pattern
+    // actually looks like: naming the specific evidence, not a
+    // vague percentage.
+    // -------------------------------------------------------------
+    const evidence = [];
+
+    evidence.push(`${distinctAccounts} different account numbers at the same branch (${ifsc}) across ${allComplaints.length} separate complaints.`);
+
+    // Signal: accounts opened/used within a tight time window (bulk mule recruitment)
+    const dates = allComplaints.map((c) => c.date_filed).filter(Boolean).sort();
+    let tightWindow = false;
+    if (dates.length >= 2) {
+      const first = new Date(dates[0]);
+      const last = new Date(dates[dates.length - 1]);
+      const spreadDays = Math.round((last - first) / (1000 * 60 * 60 * 24));
+      if (spreadDays <= 30) {
+        tightWindow = true;
+        evidence.push(`All ${allComplaints.length} complaints were filed within a ${spreadDays}-day window - consistent with a batch of mules recruited and used together.`);
+      }
+    }
+
+    // Signal: account numbers are numerically close together (often means
+    // they were opened in bulk, back-to-back, at the same branch)
+    const numericAccounts = [...accMap.keys()].map((a) => Number(a)).filter((n) => !isNaN(n)).sort((a, b) => a - b);
+    let sequential = false;
+    if (numericAccounts.length >= 3) {
+      const gaps = [];
+      for (let i = 1; i < numericAccounts.length; i++) gaps.push(numericAccounts[i] - numericAccounts[i - 1]);
+      const avgGap = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+      if (avgGap > 0 && avgGap < 500) {
+        sequential = true;
+        evidence.push(`Account numbers are numerically close together (avg. gap ${Math.round(avgGap)}) - a common sign of accounts opened in bulk at the same time.`);
+      }
+    }
+
+    // Signal: spans multiple states (mule network serving a multi-state gang)
+    if (states.length > 1) {
+      evidence.push(`Victims are spread across ${states.length} different states (${states.join(", ")}), so this is not just local coincidence.`);
+    }
+
+    // Decide the flag level from how many independent signals fired
+    const signalCount = 1 + (tightWindow ? 1 : 0) + (sequential ? 1 : 0) + (states.length > 1 ? 1 : 0);
+    const flag = signalCount >= 3 ? "SUSPECTED MULE NETWORK" : signalCount === 2 ? "POSSIBLE MULE NETWORK" : "WORTH REVIEWING";
 
     clusters.push({
       ifsc,
@@ -275,6 +321,9 @@ function buildMuleClusters(complaints, minDistinctAccounts = 3) {
       states,
       cross_state: states.length > 1,
       total_loss: totalLoss,
+      flag,
+      signal_count: signalCount,
+      evidence,
       complaints: allComplaints.map((c) => ({
         id: c.complaint_id, state: c.state, city: c.city, victim: c.victim_name,
         account: c.bank_account, amount: c.amount_lost_inr, date: c.date_filed,
@@ -283,13 +332,129 @@ function buildMuleClusters(complaints, minDistinctAccounts = 3) {
     });
   });
 
-  clusters.sort((a, b) => b.distinct_accounts - a.distinct_accounts || b.total_loss - a.total_loss);
+  clusters.sort((a, b) => b.signal_count - a.signal_count || b.distinct_accounts - a.distinct_accounts || b.total_loss - a.total_loss);
   return clusters;
 }
 
 // ---------------------------------------------------------------------
 // ANALYTICS AGGREGATION
 // ---------------------------------------------------------------------
+// ---------------------------------------------------------------------
+// MO (MODUS OPERANDI) TEXT SIMILARITY DETECTION
+// -----------------------------------------------------------------------
+// Purpose: catch a gang that uses a DIFFERENT phone/UPI/account for
+// every victim (so the exact-match engine above sees no shared
+// identifier at all), but reuses the same SCRIPT - the same lies, the
+// same threats, the same sequence of steps. Scam gangs often work from
+// a fixed script, so victims' descriptions of "what happened" end up
+// strikingly similar in wording even when every technical identifier
+// differs.
+//
+// Method: simple, dependency-free text similarity (Jaccard similarity
+// over word sets, after basic cleanup) between every pair of MO
+// descriptions. This is intentionally simple - no ML model, no
+// external API - so it runs instantly in-browser. It is a genuinely
+// useful FIRST PASS filter that most complaint-management systems do
+// not attempt at all, but it is still a proxy signal: high textual
+// similarity is a reason to have a human compare the two cases, not
+// standalone proof of a connection.
+// ---------------------------------------------------------------------
+const STOPWORDS = new Set([
+  "the","a","an","and","or","to","of","in","on","for","was","were","is","are",
+  "he","she","they","victim","fraudster","then","after","with","from","that",
+  "this","his","her","their","had","have","has","it","as","by","at","be","been",
+]);
+
+function tokenize(text) {
+  return new Set(
+    (text || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length > 2 && !STOPWORDS.has(w))
+  );
+}
+
+function jaccardSimilarity(setA, setB) {
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  setA.forEach((w) => { if (setB.has(w)) intersection += 1; });
+  const union = setA.size + setB.size - intersection;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function buildMOPatternClusters(complaints, similarityThreshold = 0.45) {
+  const withText = complaints
+    .map((c) => ({ c, tokens: tokenize(c.mo_description) }))
+    .filter((x) => x.tokens.size >= 4); // need enough words to compare meaningfully
+
+  const adjacency = new Map();
+  withText.forEach((x) => adjacency.set(x.c.complaint_id, new Set()));
+  const edgeSim = new Map();
+
+  for (let i = 0; i < withText.length; i++) {
+    for (let j = i + 1; j < withText.length; j++) {
+      const a = withText[i], b = withText[j];
+      const sim = jaccardSimilarity(a.tokens, b.tokens);
+      if (sim >= similarityThreshold) {
+        adjacency.get(a.c.complaint_id).add(b.c.complaint_id);
+        adjacency.get(b.c.complaint_id).add(a.c.complaint_id);
+        edgeSim.set([a.c.complaint_id, b.c.complaint_id].sort().join("|"), sim);
+      }
+    }
+  }
+
+  const visited = new Set();
+  const byId = new Map(withText.map((x) => [x.c.complaint_id, x.c]));
+  const clusters = [];
+
+  withText.forEach((x) => {
+    const id = x.c.complaint_id;
+    if (visited.has(id)) return;
+    const stack = [id];
+    const component = [];
+    visited.add(id);
+    while (stack.length) {
+      const cur = stack.pop();
+      component.push(cur);
+      adjacency.get(cur).forEach((n) => {
+        if (!visited.has(n)) { visited.add(n); stack.push(n); }
+      });
+    }
+    if (component.length < 2) return;
+
+    let simSum = 0, simCount = 0;
+    for (let i = 0; i < component.length; i++) {
+      for (let j = i + 1; j < component.length; j++) {
+        const key = [component[i], component[j]].sort().join("|");
+        if (edgeSim.has(key)) { simSum += edgeSim.get(key); simCount += 1; }
+      }
+    }
+
+    const members = component.map((id) => byId.get(id));
+    const states = [...new Set(members.map((c) => c.state))].sort();
+    const totalLoss = members.reduce((s, c) => s + (Number(c.amount_lost_inr) || 0), 0);
+
+    clusters.push({
+      pattern_id: null,
+      size: component.length,
+      avg_similarity: simCount ? Math.round((simSum / simCount) * 100) / 100 : 0,
+      states,
+      cross_state: states.length > 1,
+      total_loss: totalLoss,
+      complaints: members.map((c) => ({
+        id: c.complaint_id, state: c.state, city: c.city, fraud_type: c.fraud_type,
+        amount: c.amount_lost_inr, mo: c.mo_description,
+        phone: c.phone_used_by_fraudster, upi: c.upi_id, account: c.bank_account,
+      })),
+    });
+  });
+
+  clusters.sort((a, b) => b.avg_similarity - a.avg_similarity || b.size - a.size);
+  clusters.forEach((c, i) => (c.pattern_id = `PATTERN-${String(i + 1).padStart(3, "0")}`));
+  return clusters;
+}
+
 function buildAnalytics(complaints) {
   const byState = new Map();
   const byFraudType = new Map();
@@ -564,6 +729,12 @@ function Dashboard({ currentUser, onLogout }) {
   const allComplaints = useMemo(() => [...ALL_COMPLAINTS, ...extraComplaints], [extraComplaints]);
   const rings = useMemo(() => buildCorrelation(allComplaints), [allComplaints]);
   const muleClusters = useMemo(() => buildMuleClusters(allComplaints), [allComplaints]);
+  const moPatternClusters = useMemo(() => buildMOPatternClusters(allComplaints), [allComplaints]);
+  const [selectedPatternId, setSelectedPatternId] = useState(null);
+  const selectedPattern = useMemo(
+    () => moPatternClusters.find((p) => p.pattern_id === selectedPatternId) ?? null,
+    [moPatternClusters, selectedPatternId]
+  );
   const analytics = useMemo(() => buildAnalytics(allComplaints), [allComplaints]);
 
   const complaintRingMap = useMemo(() => {
@@ -879,6 +1050,9 @@ function Dashboard({ currentUser, onLogout }) {
             <div className={"view-tab" + (viewMode === "mules" ? " active" : "")} onClick={() => setViewMode("mules")}>
               Mule Clusters ({muleClusters.length})
             </div>
+            <div className={"view-tab" + (viewMode === "patterns" ? " active" : "")} onClick={() => setViewMode("patterns")}>
+              MO Patterns ({moPatternClusters.length})
+            </div>
             <div className={"view-tab" + (viewMode === "analytics" ? " active" : "")} onClick={() => setViewMode("analytics")}>
               Analytics
             </div>
@@ -968,15 +1142,16 @@ function Dashboard({ currentUser, onLogout }) {
                 </div>
               )}
             </div>
-          ) : (
+          ) : viewMode === "mules" ? (
             <div className="ring-list">
               {muleClusters.map((m) => {
                 const active = m.ifsc === selectedMuleIfsc;
+                const flagColor = m.flag === "SUSPECTED MULE NETWORK" ? "#E8543F" : m.flag === "POSSIBLE MULE NETWORK" ? "#D4A544" : "#8A93A3";
                 return (
-                  <div key={m.ifsc} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": "#D4A544" }} onClick={() => setSelectedMuleIfsc(m.ifsc)}>
+                  <div key={m.ifsc} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": flagColor }} onClick={() => setSelectedMuleIfsc(m.ifsc)}>
                     <div className="ring-item-top">
                       <span className="ring-id">{m.bank_code} · {m.ifsc}</span>
-                      <span className="risk-chip" style={{ color: "#D4A544", background: "rgba(212,165,68,0.2)", border: "1px solid #D4A54455" }}>REVIEW</span>
+                      <span className="risk-chip" style={{ color: flagColor, background: `${flagColor}22`, border: `1px solid ${flagColor}55` }}>{m.flag}</span>
                     </div>
                     <div className="ring-item-meta">
                       <span>{m.distinct_accounts} distinct accounts</span><span>·</span><span>{m.complaint_count} complaints</span>
@@ -989,6 +1164,30 @@ function Dashboard({ currentUser, onLogout }) {
               {muleClusters.length === 0 && (
                 <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
                   No suspected mule clusters yet. A branch is flagged once 3+ different account numbers at the same IFSC appear across separate complaints.
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="ring-list">
+              {moPatternClusters.map((p) => {
+                const active = p.pattern_id === selectedPatternId;
+                return (
+                  <div key={p.pattern_id} className={"ring-item" + (active ? " active" : "")} style={{ "--riskcolor": "#9B7EDE" }} onClick={() => setSelectedPatternId(p.pattern_id)}>
+                    <div className="ring-item-top">
+                      <span className="ring-id">{p.pattern_id}</span>
+                      <span className="risk-chip" style={{ color: "#9B7EDE", background: "rgba(155,126,222,0.18)", border: "1px solid #9B7EDE55" }}>{Math.round(p.avg_similarity * 100)}% MATCH</span>
+                    </div>
+                    <div className="ring-item-meta">
+                      <span>{p.size} complaints</span><span>·</span><span>no shared identifiers</span>
+                    </div>
+                    <div className="ring-item-states">{p.states.length > 3 ? p.states.slice(0, 3).join(", ") + ` +${p.states.length - 3} more` : p.states.join(", ")}</div>
+                    <div className="ring-item-loss">{fmtINR(p.total_loss)}</div>
+                  </div>
+                );
+              })}
+              {moPatternClusters.length === 0 && (
+                <div style={{ padding: 20, fontSize: 12, color: "#5B6577", textAlign: "center" }}>
+                  No text-pattern matches yet. This checks for near-identical scam descriptions even when phone/UPI/account are all different.
                 </div>
               )}
             </div>
@@ -1113,22 +1312,31 @@ function Dashboard({ currentUser, onLogout }) {
               <div className="main-toolbar">
                 <div>
                   <div className="toolbar-title">
-                    <AlertTriangle size={16} color={selectedMule ? "#D4A544" : "#5B6577"} />
+                    <AlertTriangle size={16} color={selectedMule ? (selectedMule.flag === "SUSPECTED MULE NETWORK" ? "#E8543F" : "#D4A544") : "#5B6577"} />
                     {selectedMule ? `${selectedMule.bank_code} branch — ${selectedMule.ifsc}` : "No branch selected"}
                   </div>
                   {selectedMule && <div className="toolbar-sub">{selectedMule.distinct_accounts} distinct accounts · {selectedMule.complaint_count} complaints</div>}
                 </div>
+                {selectedMule && (
+                  <div className="confidence-pill" style={{ color: selectedMule.flag === "SUSPECTED MULE NETWORK" ? "#E8543F" : "#D4A544", borderColor: selectedMule.flag === "SUSPECTED MULE NETWORK" ? "#E8543F66" : "#D4A54466", background: selectedMule.flag === "SUSPECTED MULE NETWORK" ? "rgba(232,84,63,.08)" : "rgba(212,165,68,.08)" }}>
+                    🚩 {selectedMule.flag}
+                  </div>
+                )}
               </div>
               {selectedMule ? (
                 <div className="mule-table-wrap">
                   <div className="mule-warning">
                     <AlertCircle size={14} style={{ flexShrink: 0, marginTop: 1 }} />
                     <div>
-                      <b>{selectedMule.distinct_accounts} different bank accounts</b>, all opened at the same branch
-                      (<span className="field-value" style={{ fontSize: 12 }}>{selectedMule.ifsc}</span>), appear across
-                      {" "}{selectedMule.complaint_count} separate complaints in {selectedMule.states.join(", ")}. This does
-                      not confirm a mule network on its own — it is a pattern worth manual review, since gangs often
-                      recruit multiple mules through the same local branch/agent.
+                      <b>Evidence supporting this flag:</b>
+                      <ul style={{ margin: "6px 0 0 0", paddingLeft: 18 }}>
+                        {selectedMule.evidence.map((e, i) => <li key={i} style={{ marginBottom: 4 }}>{e}</li>)}
+                      </ul>
+                      <div style={{ marginTop: 8, color: "#8A93A3" }}>
+                        This is a pattern flag based on complaint data only — it does not confirm a mule network on
+                        its own. Confirming actual money movement requires the bank's transaction records, obtainable
+                        only through a formal legal request.
+                      </div>
                     </div>
                   </div>
                   <table className="mule-table">
