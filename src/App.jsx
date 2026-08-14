@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import * as d3 from "d3";
+import * as XLSX from "xlsx";
 import {
   BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis,
   CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -7,7 +8,8 @@ import {
 import {
   AlertTriangle, MapPin, Shield, IndianRupee, Phone, CreditCard,
   ArrowLeft, Search, Plus, X, CheckCircle2, Loader2, AlertCircle, Trash2,
-  LogOut, Lock, UserPlus, Eye, EyeOff, KeyRound, BarChart3,
+  LogOut, Lock, UserPlus, Eye, EyeOff, KeyRound, BarChart3, Upload, Download,
+  FileSpreadsheet,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------
@@ -684,12 +686,196 @@ function NewComplaintModal({ onClose, onSubmit, submitting }) {
 }
 
 // ---------------------------------------------------------------------
+// BULK CSV / EXCEL UPLOAD
+// -----------------------------------------------------------------------
+// Lets an officer upload a spreadsheet of many complaints at once instead
+// of typing each one manually - the single biggest real time-saver for
+// an office dealing with volume. Accepts .csv, .xlsx, .xls. Expected
+// column headers (case-insensitive, order doesn't matter):
+//   state, city, victim_name, fraud_type, amount_lost_inr,
+//   phone_used_by_fraudster, upi_id, bank_account, ifsc_code,
+//   mo_description, date_filed (optional - defaults to today)
+// Every row is validated with the exact same rules as the manual form -
+// bulk upload does not bypass validation, it just does it for many rows
+// at once and reports which rows failed and why.
+// ---------------------------------------------------------------------
+const CSV_TEMPLATE_HEADERS = [
+  "state", "city", "victim_name", "fraud_type", "amount_lost_inr",
+  "phone_used_by_fraudster", "upi_id", "bank_account", "ifsc_code",
+  "mo_description", "date_filed",
+];
+
+function downloadCSVTemplate() {
+  const sampleRow = [
+    "Gujarat", "Ahmedabad", "Ramesh Patel", "Digital Arrest Scam", "85000",
+    "+919876543210", "example@ybl", "123456789012", "SBIN0001234",
+    "Fraudster posed as CBI officer and threatened arrest", "2026-08-01",
+  ];
+  const ws = XLSX.utils.aoa_to_sheet([CSV_TEMPLATE_HEADERS, sampleRow]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Complaints");
+  XLSX.writeFile(wb, "complaint_upload_template.xlsx");
+}
+
+function normalizeRowKeys(row) {
+  const out = {};
+  Object.keys(row).forEach((k) => {
+    const norm = k.trim().toLowerCase().replace(/\s+/g, "_");
+    out[norm] = row[k];
+  });
+  return out;
+}
+
+function BulkUploadModal({ onClose, onConfirm, uploading }) {
+  const fileInputRef = useRef(null);
+  const [fileName, setFileName] = useState("");
+  const [parsedRows, setParsedRows] = useState([]); // { row, errors, valid }
+  const [parseError, setParseError] = useState("");
+
+  const handleFile = (file) => {
+    setParseError("");
+    setFileName(file.name);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb = XLSX.read(data, { type: "array" });
+        const sheet = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(sheet, { defval: "" });
+
+        if (rows.length === 0) {
+          setParseError("The file appears to be empty.");
+          setParsedRows([]);
+          return;
+        }
+        if (rows.length > 1000) {
+          setParseError(`File has ${rows.length} rows - please upload 1000 or fewer at a time.`);
+          setParsedRows([]);
+          return;
+        }
+
+        const results = rows.map((raw, i) => {
+          const row = normalizeRowKeys(raw);
+          const form = {
+            state: String(row.state || "").trim(),
+            city: String(row.city || "").trim(),
+            victim_name: String(row.victim_name || "").trim(),
+            fraud_type: String(row.fraud_type || "").trim(),
+            amount_lost_inr: String(row.amount_lost_inr || "").trim(),
+            phone_used_by_fraudster: String(row.phone_used_by_fraudster || "").trim(),
+            upi_id: String(row.upi_id || "").trim(),
+            bank_account: String(row.bank_account || "").trim(),
+            ifsc_code: String(row.ifsc_code || "").trim().toUpperCase(),
+            mo_description: String(row.mo_description || "").trim(),
+            date_filed: String(row.date_filed || "").trim(),
+          };
+          const errors = validateComplaint(form);
+          return { rowNum: i + 2, form, errors, valid: Object.keys(errors).length === 0 }; // +2 = header row + 1-index
+        });
+
+        setParsedRows(results);
+      } catch (err) {
+        setParseError("Could not read this file. Make sure it's a valid .csv or .xlsx file.");
+        setParsedRows([]);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const validCount = parsedRows.filter((r) => r.valid).length;
+  const invalidCount = parsedRows.length - validCount;
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box" style={{ maxWidth: 720 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title"><FileSpreadsheet size={16} /> Bulk Upload Complaints</div>
+          <button className="icon-btn" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body">
+          <div className="bulk-intro">
+            Upload a .csv or .xlsx file with multiple complaints at once. Each row is validated with the
+            same rules as manual entry.
+            <button className="template-link" onClick={downloadCSVTemplate}>
+              <Download size={12} style={{ marginRight: 4 }} />Download template
+            </button>
+          </div>
+
+          <div
+            className="dropzone"
+            onClick={() => fileInputRef.current?.click()}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => { e.preventDefault(); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); }}
+          >
+            <Upload size={22} color="#5B6577" />
+            <div style={{ marginTop: 8, fontSize: 12.5, color: "#8A93A3" }}>
+              {fileName ? fileName : "Click to choose a file, or drag and drop"}
+            </div>
+            <div style={{ fontSize: 10.5, color: "#5B6577", marginTop: 4 }}>.csv, .xlsx, .xls — up to 1000 rows</div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,.xlsx,.xls"
+              style={{ display: "none" }}
+              onChange={(e) => e.target.files[0] && handleFile(e.target.files[0])}
+            />
+          </div>
+
+          {parseError && <div className="err" style={{ marginTop: 10 }}>{parseError}</div>}
+
+          {parsedRows.length > 0 && (
+            <>
+              <div className="bulk-summary">
+                <span style={{ color: "#4A9B8E" }}><CheckCircle2 size={13} style={{ display: "inline", marginRight: 4 }} />{validCount} valid</span>
+                {invalidCount > 0 && <span style={{ color: "#E8543F", marginLeft: 14 }}><AlertCircle size={13} style={{ display: "inline", marginRight: 4 }} />{invalidCount} row(s) have errors</span>}
+              </div>
+              <div className="bulk-table-wrap">
+                <table className="mule-table">
+                  <thead><tr><th>Row</th><th>State/City</th><th>Victim</th><th>Amount</th><th>Status</th></tr></thead>
+                  <tbody>
+                    {parsedRows.map((r) => (
+                      <tr key={r.rowNum}>
+                        <td className="mono">{r.rowNum}</td>
+                        <td>{r.form.city}, {r.form.state}</td>
+                        <td>{r.form.victim_name || "—"}</td>
+                        <td className="mono">{r.form.amount_lost_inr || "—"}</td>
+                        <td>
+                          {r.valid
+                            ? <span style={{ color: "#4A9B8E" }}>OK</span>
+                            : <span style={{ color: "#E8543F" }} title={Object.values(r.errors).join("; ")}>{Object.values(r.errors)[0]}</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose}>Cancel</button>
+          <button
+            className="btn-primary"
+            disabled={uploading || validCount === 0}
+            onClick={() => onConfirm(parsedRows.filter((r) => r.valid).map((r) => r.form))}
+          >
+            {uploading ? <><Loader2 size={14} className="spin" /> Uploading...</> : `Upload ${validCount} Valid Complaint(s)`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------
 // MAIN DASHBOARD
 // ---------------------------------------------------------------------
 function Dashboard({ currentUser, onLogout }) {
   const [extraComplaints, setExtraComplaints] = useState([]);
   const [loadingStorage, setLoadingStorage] = useState(true);
   const [showModal, setShowModal] = useState(false);
+  const [showBulkModal, setShowBulkModal] = useState(false);
+  const [bulkUploading, setBulkUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState(null);
   const [selectedRingId, setSelectedRingId] = useState(null);
@@ -853,6 +1039,45 @@ function Dashboard({ currentUser, onLogout }) {
     setShowModal(false);
   }, [extraComplaints, storageOK]);
 
+  const handleBulkUpload = useCallback(async (validForms) => {
+    setBulkUploading(true);
+    const newRecords = [];
+    let counter = extraComplaints.length + 1;
+
+    for (const form of validForms) {
+      const newId = "CMP-" + String(1000 + counter);
+      counter += 1;
+      const record = {
+        complaint_id: newId,
+        date_filed: form.date_filed || new Date().toISOString().slice(0, 10),
+        state: form.state,
+        city: form.city,
+        victim_name: form.victim_name,
+        fraud_type: form.fraud_type,
+        phone_used_by_fraudster: form.phone_used_by_fraudster || "",
+        upi_id: form.upi_id || "",
+        bank_account: form.bank_account || "",
+        ifsc_code: form.ifsc_code || "",
+        amount_lost_inr: Number(form.amount_lost_inr),
+        mo_description: form.mo_description || "No description provided.",
+        submitted_by_name: currentUser.name,
+        submitted_by_email: currentUser.email,
+        submitted_by_state: currentUser.state,
+        bulk_uploaded: true,
+      };
+      newRecords.push(record);
+      try {
+        if (storageOK) await appStorage.set(`complaint:${newId}`, JSON.stringify(record), true);
+      } catch (e) { setStorageOK(false); }
+    }
+
+    setExtraComplaints((prev) => [...prev, ...newRecords]);
+    setBulkUploading(false);
+    setShowBulkModal(false);
+    setToast({ type: "match", text: `${newRecords.length} complaint(s) uploaded and correlated successfully.` });
+    setTimeout(() => setToast(null), 5000);
+  }, [extraComplaints, storageOK, currentUser]);
+
   const handleClearAll = useCallback(async () => {
     setClearing(true);
     try {
@@ -987,6 +1212,13 @@ function Dashboard({ currentUser, onLogout }) {
         .form-field input:focus, .form-field select:focus, .form-field textarea:focus { border-color: var(--teal); }
         .form-field textarea { resize:vertical; font-family:'Inter',sans-serif; }
         .err { font-size:10.5px; color:var(--red); }
+        .bulk-intro { font-size:12.5px; color:var(--text-dim); line-height:1.5; margin-bottom:14px; display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+        .template-link { background:none; border:1px solid var(--border); color:var(--teal); font-size:11.5px; padding:6px 10px; border-radius:6px; cursor:pointer; display:flex; align-items:center; white-space:nowrap; font-family:'Inter',sans-serif; }
+        .template-link:hover { background:var(--panel-2); }
+        .dropzone { border:1.5px dashed var(--border); border-radius:10px; padding:28px; text-align:center; cursor:pointer; transition:border-color .15s; }
+        .dropzone:hover { border-color:var(--teal); }
+        .bulk-summary { margin-top:14px; font-size:12.5px; }
+        .bulk-table-wrap { max-height:260px; overflow-y:auto; margin-top:10px; border:1px solid var(--border); border-radius:8px; }
         .modal-footer { display:flex; justify-content:flex-end; gap:10px; padding:16px 20px; border-top:1px solid var(--border); }
         .spin { animation: spin 0.8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -1029,6 +1261,9 @@ function Dashboard({ currentUser, onLogout }) {
           </div>
           <button className="btn-primary" onClick={() => setShowModal(true)}>
             <Plus size={15} /> New Complaint
+          </button>
+          <button className="btn-secondary" onClick={() => setShowBulkModal(true)}>
+            <FileSpreadsheet size={14} style={{ marginRight: 6 }} /> Bulk Upload
           </button>
           {extraComplaints.length > 0 && (
             <button className="btn-danger" onClick={() => setShowClearConfirm(true)}>
@@ -1438,6 +1673,7 @@ function Dashboard({ currentUser, onLogout }) {
       </div>
 
       {showModal && <NewComplaintModal onClose={() => setShowModal(false)} onSubmit={handleNewComplaint} submitting={submitting} />}
+      {showBulkModal && <BulkUploadModal onClose={() => setShowBulkModal(false)} onConfirm={handleBulkUpload} uploading={bulkUploading} />}
 
       {showClearConfirm && (
         <div className="modal-overlay" onClick={() => setShowClearConfirm(false)}>
