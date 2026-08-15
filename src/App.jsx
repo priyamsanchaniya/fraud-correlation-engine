@@ -593,8 +593,8 @@ function emptyForm() {
   };
 }
 
-function NewComplaintModal({ onClose, onSubmit, submitting }) {
-  const [form, setForm] = useState(emptyForm());
+function NewComplaintModal({ onClose, onSubmit, submitting, initialData, isEdit }) {
+  const [form, setForm] = useState(() => initialData ? { ...emptyForm(), ...initialData } : emptyForm());
   const [errors, setErrors] = useState({});
 
   const update = (field, value) => setForm((f) => ({ ...f, [field]: value }));
@@ -611,7 +611,7 @@ function NewComplaintModal({ onClose, onSubmit, submitting }) {
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-box" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <div className="modal-title"><Plus size={16} /> New Complaint Intake</div>
+          <div className="modal-title">{isEdit ? <><CheckCircle2 size={16} /> Edit Complaint</> : <><Plus size={16} /> New Complaint Intake</>}</div>
           <button className="icon-btn" onClick={onClose}><X size={16} /></button>
         </div>
         <div className="modal-body">
@@ -677,7 +677,9 @@ function NewComplaintModal({ onClose, onSubmit, submitting }) {
         <div className="modal-footer">
           <button className="btn-secondary" onClick={onClose}>Cancel</button>
           <button className="btn-primary" onClick={handleSubmit} disabled={submitting}>
-            {submitting ? <><Loader2 size={14} className="spin" /> Correlating...</> : "Submit & Correlate"}
+            {submitting
+              ? <><Loader2 size={14} className="spin" /> {isEdit ? "Saving..." : "Correlating..."}</>
+              : (isEdit ? "Save Changes" : "Submit & Correlate")}
           </button>
         </div>
       </div>
@@ -874,6 +876,7 @@ function Dashboard({ currentUser, onLogout }) {
   const [extraComplaints, setExtraComplaints] = useState([]);
   const [loadingStorage, setLoadingStorage] = useState(true);
   const [showModal, setShowModal] = useState(false);
+  const [editingComplaint, setEditingComplaint] = useState(null); // complaint object being edited, or null
   const [showBulkModal, setShowBulkModal] = useState(false);
   const [bulkUploading, setBulkUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -884,6 +887,7 @@ function Dashboard({ currentUser, onLogout }) {
   const [viewMode, setViewMode] = useState("rings"); // "rings" | "mules" | "analytics" | "all"
   const [selectedMuleIfsc, setSelectedMuleIfsc] = useState(null);
   const [selectedAllComplaintId, setSelectedAllComplaintId] = useState(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
   const [highlightId, setHighlightId] = useState(null);
   const [storageOK, setStorageOK] = useState(true);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
@@ -982,10 +986,11 @@ function Dashboard({ currentUser, onLogout }) {
 
   const handleNewComplaint = useCallback(async (form) => {
     setSubmitting(true);
-    const newId = "CMP-" + String(1000 + extraComplaints.length + 1);
+    const isEditMode = !!editingComplaint;
+    const complaintId = isEditMode ? editingComplaint.complaint_id : "CMP-" + String(1000 + extraComplaints.length + 1);
     const record = {
-      complaint_id: newId,
-      date_filed: new Date().toISOString().slice(0, 10),
+      complaint_id: complaintId,
+      date_filed: isEditMode ? editingComplaint.date_filed : new Date().toISOString().slice(0, 10),
       state: form.state,
       city: form.city,
       victim_name: form.victim_name,
@@ -996,14 +1001,15 @@ function Dashboard({ currentUser, onLogout }) {
       ifsc_code: form.ifsc_code.trim(),
       amount_lost_inr: Number(form.amount_lost_inr),
       mo_description: form.mo_description || "No description provided.",
-      submitted_by_name: currentUser.name,
-      submitted_by_email: currentUser.email,
-      submitted_by_state: currentUser.state,
+      submitted_by_name: isEditMode ? editingComplaint.submitted_by_name : currentUser.name,
+      submitted_by_email: isEditMode ? editingComplaint.submitted_by_email : currentUser.email,
+      submitted_by_state: isEditMode ? editingComplaint.submitted_by_state : currentUser.state,
+      ...(isEditMode ? { last_edited_by: currentUser.name, last_edited_at: new Date().toISOString() } : {}),
     };
 
     try {
       if (storageOK) {
-        await appStorage.set(`complaint:${newId}`, JSON.stringify(record), true);
+        await appStorage.set(`complaint:${complaintId}`, JSON.stringify(record), true);
       }
     } catch (e) {
       setStorageOK(false);
@@ -1014,14 +1020,18 @@ function Dashboard({ currentUser, onLogout }) {
     await new Promise((r) => setTimeout(r, 400));
 
     setExtraComplaints((prev) => {
-      const next = [...prev, record];
-      // figure out which ring this lands in after state updates
+      const next = isEditMode
+        ? prev.map((c) => (c.complaint_id === complaintId ? record : c))
+        : [...prev, record];
+
       setTimeout(() => {
         const recomputed = buildCorrelation([...ALL_COMPLAINTS, ...next]);
-        const owningRing = recomputed.find((r) => r.member_ids.includes(newId));
-        if (owningRing) {
+        const owningRing = recomputed.find((r) => r.member_ids.includes(complaintId));
+        if (isEditMode) {
+          setToast({ type: "match", text: "Complaint updated and re-correlated." });
+        } else if (owningRing) {
           setSelectedRingId(owningRing.cluster_id);
-          setHighlightId(newId);
+          setHighlightId(complaintId);
           setToast({
             type: "match",
             text: `Linked to ${owningRing.size - 1} existing complaint(s) in ${owningRing.cluster_id} — ${owningRing.states.join(", ")}`,
@@ -1037,7 +1047,19 @@ function Dashboard({ currentUser, onLogout }) {
 
     setSubmitting(false);
     setShowModal(false);
-  }, [extraComplaints, storageOK]);
+    setEditingComplaint(null);
+  }, [extraComplaints, storageOK, editingComplaint, currentUser]);
+
+  const handleDeleteComplaint = useCallback(async (complaintId) => {
+    try {
+      if (storageOK) await appStorage.delete(`complaint:${complaintId}`, true);
+    } catch (e) { /* ignore, still remove locally */ }
+    setExtraComplaints((prev) => prev.filter((c) => c.complaint_id !== complaintId));
+    setSelectedAllComplaintId((id) => (id === complaintId ? null : id));
+    setSelectedNodeId((id) => (id === complaintId ? null : id));
+    setToast({ type: "isolated", text: `${complaintId} deleted.` });
+    setTimeout(() => setToast(null), 4000);
+  }, [storageOK]);
 
   const handleBulkUpload = useCallback(async (validForms) => {
     setBulkUploading(true);
@@ -1219,6 +1241,9 @@ function Dashboard({ currentUser, onLogout }) {
         .dropzone:hover { border-color:var(--teal); }
         .bulk-summary { margin-top:14px; font-size:12.5px; }
         .bulk-table-wrap { max-height:260px; overflow-y:auto; margin-top:10px; border:1px solid var(--border); border-radius:8px; }
+        .row-action-btn { background:none; border:1px solid var(--border); color:var(--text-dim); padding:5px; border-radius:5px; cursor:pointer; display:flex; align-items:center; justify-content:center; }
+        .row-action-btn:hover { background:var(--panel); color:var(--text); }
+        .row-action-danger:hover { color:var(--red); border-color:rgba(232,84,63,.5); }
         .modal-footer { display:flex; justify-content:flex-end; gap:10px; padding:16px 20px; border-top:1px solid var(--border); }
         .spin { animation: spin 0.8s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -1504,7 +1529,7 @@ function Dashboard({ currentUser, onLogout }) {
               </div>
               <table className="mule-table">
                 <thead>
-                  <tr><th>ID</th><th>Date</th><th>State / City</th><th>Fraud Type</th><th>Amount</th><th>Status</th></tr>
+                  <tr><th>ID</th><th>Date</th><th>State / City</th><th>Fraud Type</th><th>Amount</th><th>Status</th><th>Actions</th></tr>
                 </thead>
                 <tbody>
                   {filteredAllComplaints.map((c) => {
@@ -1517,6 +1542,16 @@ function Dashboard({ currentUser, onLogout }) {
                         <td>{c.fraud_type}</td>
                         <td className="mono">{fmtINR(Number(c.amount_lost_inr) || 0)}</td>
                         <td>{ringId ? <span style={{ color: "#E8543F" }}>In {ringId}</span> : <span style={{ color: "#6B7A8F" }}>Isolated</span>}</td>
+                        <td onClick={(e) => e.stopPropagation()}>
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <button className="row-action-btn" title="Edit" onClick={() => { setEditingComplaint(c); setShowModal(true); }}>
+                              <CheckCircle2 size={13} />
+                            </button>
+                            <button className="row-action-btn row-action-danger" title="Delete" onClick={() => setConfirmDeleteId(c.complaint_id)}>
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </td>
                       </tr>
                     );
                   })}
@@ -1634,8 +1669,27 @@ function Dashboard({ currentUser, onLogout }) {
               {selectedAllComplaint.submitted_by_name && (
                 <div className="hint-text">
                   Submitted by <b>{selectedAllComplaint.submitted_by_name}</b> ({selectedAllComplaint.submitted_by_state} Cyber Cell)
+                  {selectedAllComplaint.last_edited_by && (
+                    <> · last edited by <b>{selectedAllComplaint.last_edited_by}</b></>
+                  )}
                 </div>
               )}
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}>
+                <button
+                  className="btn-secondary"
+                  style={{ flex: 1 }}
+                  onClick={() => { setEditingComplaint(selectedAllComplaint); setShowModal(true); }}
+                >
+                  Edit
+                </button>
+                <button
+                  className="btn-danger"
+                  style={{ flex: 1, justifyContent: "center" }}
+                  onClick={() => setConfirmDeleteId(selectedAllComplaint.complaint_id)}
+                >
+                  <Trash2 size={13} style={{ marginRight: 6 }} /> Delete
+                </button>
+              </div>
             </>
           ) : selectedNode ? (
             <>
@@ -1672,8 +1726,43 @@ function Dashboard({ currentUser, onLogout }) {
         </aside>
       </div>
 
-      {showModal && <NewComplaintModal onClose={() => setShowModal(false)} onSubmit={handleNewComplaint} submitting={submitting} />}
+      {showModal && (
+        <NewComplaintModal
+          onClose={() => { setShowModal(false); setEditingComplaint(null); }}
+          onSubmit={handleNewComplaint}
+          submitting={submitting}
+          initialData={editingComplaint}
+          isEdit={!!editingComplaint}
+        />
+      )}
       {showBulkModal && <BulkUploadModal onClose={() => setShowBulkModal(false)} onConfirm={handleBulkUpload} uploading={bulkUploading} />}
+
+      {confirmDeleteId && (
+        <div className="modal-overlay" onClick={() => setConfirmDeleteId(null)}>
+          <div className="modal-box" style={{ maxWidth: 420 }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title"><Trash2 size={16} color="#E8543F" /> Delete Complaint</div>
+              <button className="icon-btn" onClick={() => setConfirmDeleteId(null)}><X size={16} /></button>
+            </div>
+            <div className="modal-body">
+              <p style={{ fontSize: 13, color: "#8A93A3", lineHeight: 1.6 }}>
+                This will permanently delete complaint <b>{confirmDeleteId}</b>. This cannot be undone, and any
+                fraud ring, mule cluster, or pattern it was part of will be recalculated without it.
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setConfirmDeleteId(null)}>Cancel</button>
+              <button
+                className="btn-primary"
+                style={{ background: "#E8543F", color: "white" }}
+                onClick={() => { handleDeleteComplaint(confirmDeleteId); setConfirmDeleteId(null); }}
+              >
+                Yes, delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {showClearConfirm && (
         <div className="modal-overlay" onClick={() => setShowClearConfirm(false)}>
