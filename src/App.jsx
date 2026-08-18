@@ -29,7 +29,7 @@ const ALL_COMPLAINTS = []; // no longer used for data - kept only so any
 //   - Deployed backend: "https://your-backend.onrender.com" (or wherever
 //     you deploy it - see backend/README.md)
 // ---------------------------------------------------------------------
-const API_BASE = "http://localhost:5000";
+const API_BASE = "https://fraud-correlation-backend.onrender.com";
 
 class APIError extends Error {
   constructor(message, status) {
