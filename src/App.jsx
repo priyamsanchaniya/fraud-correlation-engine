@@ -9,7 +9,7 @@ import {
   AlertTriangle, MapPin, Shield, IndianRupee, Phone, CreditCard,
   ArrowLeft, Search, Plus, X, CheckCircle2, Loader2, AlertCircle, Trash2,
   LogOut, Lock, UserPlus, Eye, EyeOff, KeyRound, BarChart3, Upload, Download,
-  FileSpreadsheet,
+  FileSpreadsheet, Bell, Clock, FileText,
 } from "lucide-react";
 
 // ---------------------------------------------------------------------
@@ -29,7 +29,7 @@ const ALL_COMPLAINTS = []; // no longer used for data - kept only so any
 //   - Deployed backend: "https://your-backend.onrender.com" (or wherever
 //     you deploy it - see backend/README.md)
 // ---------------------------------------------------------------------
-const API_BASE = "https://fraud-correlation-backend.onrender.com";
+const API_BASE = "http://localhost:5000";
 
 class APIError extends Error {
   constructor(message, status) {
@@ -959,6 +959,12 @@ function Dashboard({ currentUser, authToken, onLogout }) {
   const [highlightId, setHighlightId] = useState(null);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [notifications, setNotifications] = useState([]);
+  const [showNotifPanel, setShowNotifPanel] = useState(false);
+  const [showTimelineModal, setShowTimelineModal] = useState(false);
+  const seenRingIds = useRef(new Set());
+  const seenMuleFlags = useRef(new Map()); // ifsc -> flag last seen
+  const isFirstLoad = useRef(true);
 
   // Pulls fresh complaints + computed rings/mule-clusters/patterns/analytics
   // from the backend. Called on mount and after every create/edit/delete/
@@ -979,10 +985,63 @@ function Dashboard({ currentUser, authToken, onLogout }) {
       setMoPatternClusters(patternsData);
       setAnalyticsRaw(analyticsData);
       setApiErrorBanner("");
+
+      // --- SMART ALERTS: detect newly-appeared critical patterns ---
+      // Skip on the very first load (nothing is "new" yet, it's all
+      // pre-existing data) - only alert on things that appear AFTER
+      // that, which is what makes this feel like a live monitor rather
+      // than just re-announcing everything every refresh.
+      if (!isFirstLoad.current) {
+        const newAlerts = [];
+
+        ringsData.forEach((r) => {
+          const risk = riskLevel(r);
+          if (!seenRingIds.current.has(r.cluster_id) && (risk === "critical" || risk === "high")) {
+            newAlerts.push({
+              id: `ring-${r.cluster_id}-${Date.now()}`,
+              type: "ring",
+              level: risk,
+              text: `${risk === "critical" ? "🔴 CRITICAL" : "🟡 HIGH-RISK"} fraud ring detected: ${r.cluster_id} — ${r.size} complaints across ${r.states.join(", ")}, ${fmtINR(r.total_loss)} lost.`,
+              targetId: r.cluster_id,
+              time: new Date().toISOString(),
+            });
+          }
+        });
+
+        mulesData.forEach((m) => {
+          const prevFlag = seenMuleFlags.current.get(m.ifsc);
+          if (m.flag === "SUSPECTED MULE NETWORK" && prevFlag !== "SUSPECTED MULE NETWORK") {
+            newAlerts.push({
+              id: `mule-${m.ifsc}-${Date.now()}`,
+              type: "mule",
+              level: "critical",
+              text: `🚩 SUSPECTED MULE NETWORK flagged: ${m.bank_code} branch (${m.ifsc}) — ${m.distinct_accounts} accounts across ${m.complaint_count} complaints.`,
+              targetId: m.ifsc,
+              time: new Date().toISOString(),
+            });
+          }
+          seenMuleFlags.current.set(m.ifsc, m.flag);
+        });
+
+        if (newAlerts.length > 0) {
+          setNotifications((prev) => [...newAlerts, ...prev].slice(0, 30));
+        }
+      }
+
+      seenRingIds.current = new Set(ringsData.map((r) => r.cluster_id));
+      isFirstLoad.current = false;
     } catch (e) {
       setApiErrorBanner(e.message || "Could not reach the backend.");
     }
   }, [authToken]);
+
+  // Poll the backend periodically so alerts surface even when another
+  // officer (on a different computer) adds the complaint that completes
+  // a pattern - not just when you personally submit something.
+  useEffect(() => {
+    const interval = setInterval(() => { refreshAll(); }, 45000);
+    return () => clearInterval(interval);
+  }, [refreshAll]);
 
   useEffect(() => {
     (async () => {
@@ -1210,6 +1269,29 @@ function Dashboard({ currentUser, authToken, onLogout }) {
         }
         .dash-header { display:flex; align-items:center; justify-content:space-between; padding:18px 28px; border-bottom:1px solid var(--border); background:linear-gradient(180deg,#0D121B 0%,#0A0E14 100%); flex-wrap: wrap; gap: 12px; }
         .api-error-banner { display:flex; align-items:center; gap:8px; padding:9px 24px; background:rgba(232,84,63,.1); border-bottom:1px solid rgba(232,84,63,.3); color:#E8543F; font-size:12.5px; }
+        .notif-wrap { position:relative; }
+        .icon-btn-outline { background:transparent; border:1px solid var(--border); color:var(--text-dim); padding:9px; border-radius:6px; cursor:pointer; position:relative; display:flex; align-items:center; }
+        .icon-btn-outline:hover { background:var(--panel-2); color:var(--text); }
+        .notif-badge { position:absolute; top:-5px; right:-5px; background:#E8543F; color:white; font-size:9px; font-weight:700; min-width:16px; height:16px; border-radius:8px; display:flex; align-items:center; justify-content:center; padding:0 3px; font-family:'JetBrains Mono',monospace; }
+        .notif-panel { position:absolute; top:calc(100% + 8px); right:0; width:360px; max-height:420px; background:var(--panel); border:1px solid var(--border); border-radius:10px; box-shadow:0 12px 32px rgba(0,0,0,.5); z-index:70; display:flex; flex-direction:column; }
+        .notif-panel-header { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border); font-size:12.5px; font-weight:600; color:var(--text); }
+        .notif-clear { background:none; border:none; color:var(--teal); font-size:11px; cursor:pointer; font-family:'Inter',sans-serif; }
+        .notif-list { overflow-y:auto; max-height:360px; }
+        .notif-empty { padding:20px 16px; font-size:12px; color:var(--text-faint); line-height:1.5; }
+        .notif-item { padding:12px 14px; border-bottom:1px solid var(--border); cursor:pointer; }
+        .notif-item:hover { background:var(--panel-2); }
+        .notif-text { font-size:12px; color:var(--text-dim); line-height:1.5; }
+        .notif-time { font-size:10px; color:var(--text-faint); margin-top:5px; font-family:'JetBrains Mono',monospace; }
+        .case-narrative { font-size:12.5px; line-height:1.6; color:var(--text-dim); background:var(--panel-2); border:1px solid var(--border); border-radius:8px; padding:14px; margin-bottom:18px; }
+        .timeline-wrap { position:relative; }
+        .timeline-item { position:relative; padding-left:24px; padding-bottom:20px; }
+        .timeline-item:last-child { padding-bottom:0; }
+        .timeline-dot { position:absolute; left:0; top:4px; width:10px; height:10px; border-radius:50%; background:var(--teal); border:2px solid var(--bg); box-shadow:0 0 0 2px var(--teal); }
+        .timeline-line { position:absolute; left:4px; top:16px; bottom:-4px; width:1.5px; background:var(--border); }
+        .timeline-date { font-family:'JetBrains Mono',monospace; font-size:10.5px; color:var(--text-faint); margin-bottom:3px; }
+        .timeline-title { font-size:13px; font-weight:600; color:var(--text); }
+        .timeline-meta { font-size:11.5px; color:var(--text-dim); margin-top:2px; }
+        .timeline-mo { font-size:11.5px; color:var(--text-faint); margin-top:6px; line-height:1.5; background:var(--panel-2); border-radius:6px; padding:8px 10px; }
         .dash-title-block { display:flex; align-items:center; gap:14px; }
         .dash-badge { font-family:'JetBrains Mono',monospace; font-size:10px; letter-spacing:.12em; color:var(--red); border:1px solid rgba(232,84,63,.4); background:rgba(232,84,63,.08); padding:3px 8px; border-radius:3px; }
         .officer-badge { text-align:right; padding-right:20px; border-right:1px solid var(--border); }
@@ -1365,6 +1447,42 @@ function Dashboard({ currentUser, authToken, onLogout }) {
               <Trash2 size={14} /> Clear Entered Data ({allComplaints.length})
             </button>
           )}
+          <div className="notif-wrap">
+            <button className="icon-btn-outline" onClick={() => setShowNotifPanel((s) => !s)}>
+              <Bell size={15} />
+              {notifications.length > 0 && <span className="notif-badge">{notifications.length > 9 ? "9+" : notifications.length}</span>}
+            </button>
+            {showNotifPanel && (
+              <div className="notif-panel">
+                <div className="notif-panel-header">
+                  <span>Smart Alerts</span>
+                  {notifications.length > 0 && (
+                    <button className="notif-clear" onClick={() => setNotifications([])}>Clear all</button>
+                  )}
+                </div>
+                <div className="notif-list">
+                  {notifications.length === 0 ? (
+                    <div className="notif-empty">No alerts yet. You'll be notified here when a new complaint completes a critical fraud ring or a suspected mule network is flagged — including ones added by other officers.</div>
+                  ) : (
+                    notifications.map((n) => (
+                      <div
+                        key={n.id}
+                        className="notif-item"
+                        onClick={() => {
+                          if (n.type === "ring") { setViewMode("rings"); setSelectedRingId(n.targetId); }
+                          else { setViewMode("mules"); setSelectedMuleIfsc(n.targetId); }
+                          setShowNotifPanel(false);
+                        }}
+                      >
+                        <div className="notif-text">{n.text}</div>
+                        <div className="notif-time">{new Date(n.time).toLocaleTimeString()}</div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
           <button className="btn-secondary" onClick={onLogout}>
             <LogOut size={13} style={{ marginRight: 6 }} /> Logout
           </button>
@@ -1795,6 +1913,9 @@ function Dashboard({ currentUser, authToken, onLogout }) {
               <div className="field-row"><Shield size={13} /><div><div className="field-label">Complaints in ring</div><div className="field-value">{selectedRing.size}</div></div></div>
               <div className="field-row"><AlertTriangle size={13} /><div><div className="field-label">Avg link confidence</div><div className="field-value">{Math.round(selectedRing.avg_confidence * 100)}%</div></div></div>
               <div className="field-row"><MapPin size={13} /><div><div className="field-label">Cross-state spread</div><div className="field-value">{selectedRing.cross_state ? "Yes" : "No"}</div></div></div>
+              <button className="btn-secondary" style={{ width: "100%", marginTop: 14, justifyContent: "center", display: "flex" }} onClick={() => setShowTimelineModal(true)}>
+                <Clock size={13} style={{ marginRight: 6 }} /> View Case Timeline
+              </button>
               <div className="hint-text">Click any node in the graph to open its full complaint record, shared identifiers, and modus operandi.</div>
             </>
           ) : (
@@ -1802,6 +1923,10 @@ function Dashboard({ currentUser, authToken, onLogout }) {
           )}
         </aside>
       </div>
+
+      {showTimelineModal && selectedRing && (
+        <CaseTimelineModal ring={selectedRing} onClose={() => setShowTimelineModal(false)} />
+      )}
 
       {showModal && (
         <NewComplaintModal
@@ -1875,8 +2000,119 @@ function Dashboard({ currentUser, authToken, onLogout }) {
   );
 }
 
-// =======================================================================
-// AUTHENTICATION LAYER
+// ---------------------------------------------------------------------
+// CASE TIMELINE — chronological view of a ring's complaints, plus a
+// downloadable case report suitable for briefing a senior officer or
+// attaching to a case file.
+// ---------------------------------------------------------------------
+function buildCaseNarrative(ring) {
+  const sorted = [...ring.nodes].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const first = sorted[0];
+  const last = sorted[sorted.length - 1];
+  const states = ring.states.join(", ");
+
+  let narrative = `This suspected fraud ring (${ring.cluster_id}) comprises ${ring.size} complaints `;
+  narrative += `filed across ${ring.states.length} state${ring.states.length > 1 ? "s" : ""} (${states}), `;
+  narrative += `linked by shared fraudster identifiers with an average confidence of ${Math.round(ring.avg_confidence * 100)}%. `;
+  if (first) {
+    narrative += `The earliest complaint on record was filed on ${first.date} in ${first.city}, ${first.state}`;
+    narrative += first.id !== last.id ? `, with the most recent filed on ${last.date} in ${last.city}, ${last.state}. ` : `. `;
+  }
+  narrative += `Total reported financial loss across all linked complaints is ${fmtINR(ring.total_loss)}. `;
+  narrative += `This summary reflects victim-reported complaint data only and does not constitute confirmed identification of any individual — `;
+  narrative += `identity verification requires a formal legal request to the relevant bank(s) / NPCI.`;
+  return narrative;
+}
+
+function downloadCaseReport(ring) {
+  const sorted = [...ring.nodes].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const narrative = buildCaseNarrative(ring);
+  const lines = [];
+  lines.push(`CASE REPORT — ${ring.cluster_id}`);
+  lines.push(`Generated: ${new Date().toLocaleString()}`);
+  lines.push("=".repeat(60));
+  lines.push("");
+  lines.push("SUMMARY");
+  lines.push("-".repeat(60));
+  lines.push(narrative);
+  lines.push("");
+  lines.push("CLUSTER STATISTICS");
+  lines.push("-".repeat(60));
+  lines.push(`Complaints in ring: ${ring.size}`);
+  lines.push(`States involved: ${ring.states.join(", ")}`);
+  lines.push(`Cross-state: ${ring.cross_state ? "Yes" : "No"}`);
+  lines.push(`Average link confidence: ${Math.round(ring.avg_confidence * 100)}%`);
+  lines.push(`Total reported loss: ${fmtINR(ring.total_loss)}`);
+  lines.push("");
+  lines.push("CHRONOLOGICAL TIMELINE");
+  lines.push("-".repeat(60));
+  sorted.forEach((n, i) => {
+    lines.push(`${i + 1}. ${n.date || "Date unknown"} — ${n.id}`);
+    lines.push(`   Victim: ${n.victim} | Location: ${n.city}, ${n.state}`);
+    lines.push(`   Fraud type: ${n.fraud_type} | Amount lost: ${fmtINR(n.amount)}`);
+    if (n.phone) lines.push(`   Phone: ${n.phone}`);
+    if (n.upi) lines.push(`   UPI: ${n.upi}`);
+    if (n.account) lines.push(`   Account: ${n.account}`);
+    if (n.mo) lines.push(`   MO: ${n.mo}`);
+    lines.push("");
+  });
+  lines.push("-".repeat(60));
+  lines.push("NOTE: This report is generated from victim-reported complaint data");
+  lines.push("and correlation analysis only. It does not confirm the identity of");
+  lines.push("any individual. Identity verification requires a formal legal");
+  lines.push("request (e.g. CrPC Section 91) to the relevant bank(s) / NPCI.");
+
+  const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `case_report_${ring.cluster_id}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function CaseTimelineModal({ ring, onClose }) {
+  const sorted = [...ring.nodes].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const narrative = buildCaseNarrative(ring);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-box" style={{ maxWidth: 640 }} onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <div className="modal-title"><Clock size={16} /> Case Timeline — {ring.cluster_id}</div>
+          <button className="icon-btn" onClick={onClose}><X size={16} /></button>
+        </div>
+        <div className="modal-body">
+          <div className="case-narrative">{narrative}</div>
+
+          <div className="timeline-wrap">
+            {sorted.map((n, i) => (
+              <div className="timeline-item" key={n.id}>
+                <div className="timeline-dot" />
+                {i < sorted.length - 1 && <div className="timeline-line" />}
+                <div className="timeline-content">
+                  <div className="timeline-date">{n.date || "Date unknown"}</div>
+                  <div className="timeline-title">{n.id} — {n.victim}</div>
+                  <div className="timeline-meta">{n.city}, {n.state} · {n.fraud_type} · {fmtINR(n.amount)}</div>
+                  {n.mo && <div className="timeline-mo">{n.mo}</div>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="modal-footer">
+          <button className="btn-secondary" onClick={onClose}>Close</button>
+          <button className="btn-primary" onClick={() => downloadCaseReport(ring)}>
+            <FileText size={14} style={{ marginRight: 6 }} /> Download Case Report
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // -----------------------------------------------------------------------
 // IMPORTANT (read before deploying this for real use):
 // This authentication is CLIENT-SIDE ONLY. Passwords are hashed with
